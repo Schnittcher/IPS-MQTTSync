@@ -1,10 +1,14 @@
-<?php
+<?php /** @noinspection AutoloadingIssuesInspection */
 
 declare(strict_types=1);
 
 class MQTTSyncServer extends IPSModule
 {
-    public function Create()
+
+    private const GUID_MQTT_SEND = '{043EA491-0325-4ADD-8FC2-A30C8EEB4D3F}';
+    private const MQTT_PACKET_PUBLISH = 3;
+
+    public function Create(): void
     {
         //Never delete this line!
         parent::Create();
@@ -14,7 +18,7 @@ class MQTTSyncServer extends IPSModule
         $this->RegisterPropertyString('Devices', '[]');
     }
 
-    public function ApplyChanges()
+    public function ApplyChanges(): void
     {
         //Never delete this line!
         parent::ApplyChanges();
@@ -28,32 +32,30 @@ class MQTTSyncServer extends IPSModule
         $DevicesJSON = $this->ReadPropertyString('Devices');
         if ($DevicesJSON != '') {
             $Devices = json_decode($DevicesJSON);
-            foreach ($Devices as $key=>$Device) {
-                $this->SendDebug(__FUNCTION__ . 'Devices', $Device->ObjectID . ' ' . $Device->MQTTTopic, 0);
+            foreach ($Devices as $Device) {
+                $this->SendDebug(__FUNCTION__ , 'Device: #' . $Device->ObjectID . ' ' . $Device->MQTTTopic, 0);
                 $Instanz = IPS_GetObject($Device->ObjectID);
                 switch ($Instanz['ObjectType']) {
-                    case 1: //Object
-                        foreach ($Instanz['ChildrenIDs'] as $Children) {
-                            if (IPS_VariableExists($Children)) {
-                                $this->RegisterMessage($Children, VM_UPDATE);
-                                $this->RegisterReference($Children);
-                                array_push($activeMessages, $Children);
+                    case OBJECTTYPE_INSTANCE:
+                        foreach ($Instanz['ChildrenIDs'] as $ChildId) {
+                            if (IPS_VariableExists($ChildId)) {
+                                $this->RegisterMessage($ChildId, VM_UPDATE);
+                                $activeMessages[] = $ChildId;
                             }
                         }
                         break;
-                    case 2: //Variable
+                    case OBJECTTYPE_VARIABLE:
                         if (IPS_VariableExists($Instanz['ObjectID'])) {
-                            $this->RegisterMessage($Instanz['ObjectID'], VM_UPDATE);
-                            $this->RegisterReference($Instanz['ObjectID']);
-                            array_push($activeMessages, $Instanz['ObjectID']);
+                            $activeMessages[] = $Instanz['ObjectID'];
                         }
                         break;
-                    case 3:
+                    case OBJECTTYPE_SCRIPT:
                         $this->SendDebug(__FUNCTION__, 'Script', 0);
                         break;
                 }
+                $this->RegisterReference($Device->ObjectID);
             }
-            //Unregesiter Variablen - welche nicht mehr in der Liste vorhanden sind
+            //Unregister Variablen - welche nicht mehr in der Liste vorhanden sind
             $MessageList = $this->GetMessageList();
             foreach ($MessageList as $key=>$Device) {
                 if (!in_array($key, $activeMessages)) {
@@ -64,60 +66,31 @@ class MQTTSyncServer extends IPSModule
         }
     }
 
-    public function MessageSink($TimeStamp, $SenderID, $Message, $Data)
+    public function MessageSink($TimeStamp, $SenderID, $Message, $Data): void
     {
         switch ($Message) {
             case VM_UPDATE:
-
                 if ($Data[1]) { // HasDiff
-                    $Topic = '';
-                    $Instanz = null;
-                    $Object = IPS_GetObject($SenderID);
-
+                    $TargetID = $SenderID;
+                    // Wenn der Sender Teil einer Instanz ist, die wir überwachen,
+                    // nehmen wir die Eltern-ID als Ziel (damit alle Kinder gesendet werden)
                     if ($this->isInstance($SenderID)) {
-                        $Topic = $this->TopicFromList($Object['ParentID']);
-                        $PObject = IPS_GetObject($Object['ParentID']);
-                        $i = 0;
-                        foreach ($PObject['ChildrenIDs'] as $Children) {
-                            if (IPS_VariableExists($Children)) {
-                                $tmpObject = IPS_GetObject($Children);
-                                $Instanz[$i]['ID'] = $tmpObject['ObjectID'];
-                                $Instanz[$i]['Name'] = $tmpObject['ObjectName'];
-                                $Instanz[$i]['ObjectIdent'] = $tmpObject['ObjectIdent'];
-                                $Instanz[$i]['VariableTyp'] = IPS_GetVariable($tmpObject['ObjectID'])['VariableType'];
-                                $Instanz[$i]['VariableAction'] = IPS_GetVariable($tmpObject['ObjectID'])['VariableAction'];
-                                $Instanz[$i]['VariableCustomAction'] = IPS_GetVariable($tmpObject['ObjectID'])['VariableAction'];
-                                $Instanz[$i]['VariableProfile'] = IPS_GetVariable($tmpObject['ObjectID'])['VariableProfile'];
-                                $Instanz[$i]['VariableCustomProfile'] = IPS_GetVariable($tmpObject['ObjectID'])['VariableCustomProfile'];
-                                $Instanz[$i]['Value'] = GetValue($tmpObject['ObjectID']);
-                                $i++;
-                            }
-                        }
-                    } else {
-                        $Topic = $this->TopicFromList($Object['ObjectID']);
-                        $Instanz[0]['ID'] = $Object['ObjectID'];
-                        $Instanz[0]['Name'] = $Object['ObjectName'];
-                        $Instanz[0]['ObjectIdent'] = $Object['ObjectIdent'];
-                        $Instanz[0]['VariableTyp'] = IPS_GetVariable($Object['ObjectID'])['VariableType'];
-                        $Instanz[0]['VariableAction'] = IPS_GetVariable($Object['ObjectID'])['VariableAction'];
-                        $Instanz[0]['VariableCustomAction'] = IPS_GetVariable($Object['ObjectID'])['VariableCustomAction'];
-                        $Instanz[0]['VariableProfile'] = IPS_GetVariable($Object['ObjectID'])['VariableProfile'];
-                        $Instanz[0]['VariableCustomProfile'] = IPS_GetVariable($Object['ObjectID'])['VariableCustomProfile'];
-                        $Instanz[0]['Value'] = GetValue($Object['ObjectID']);
+                        $TargetID = IPS_GetObject($SenderID)['ParentID'];
                     }
 
-                    if ($Instanz != null) {
-                        $Payload = json_encode($Instanz);
-                        $this->SendMQTTData($Topic, $Payload);
-                    }
-                    if ($Topic == '') {
-                        $this->SendDebug(__FUNCTION__, 'Topic for Object ID: ' . $Object['ObjectID'] . ' is not on list!', 0);
+                    $Topic = $this->TopicFromList($TargetID);
+
+                    if ($Topic != '') {
+                        $this->sendDeviceStatus($TargetID, $Topic);
+                    } else {
+                        $this->SendDebug(__FUNCTION__, 'Topic for Object ID: ' . $SenderID . ' is not on list!', 0);
                     }
                 }
-            }
+                break;
+        }
     }
 
-    public function ReceiveData($JSONString)
+    public function ReceiveData($JSONString): string
     {
         $this->SendDebug('ReceiveData JSON', $JSONString, 0);
         $Data = json_decode($JSONString);
@@ -149,7 +122,7 @@ class MQTTSyncServer extends IPSModule
                 } else {
                     SetValue($VariablenID, $Payload->Value);
                 }
-                return;
+                return '';
             }
 
             if ($Topic == 'get') {
@@ -162,7 +135,7 @@ class MQTTSyncServer extends IPSModule
                         $this->SendDebug(__FUNCTION__, 'Invalid get Payload: ' . $Payload->config, 0);
                         break;
                 }
-                return;
+                return '';
             }
 
             $this->SendDebug(__FUNCTION__ . ' Topic', $Topic, 0);
@@ -182,11 +155,12 @@ class MQTTSyncServer extends IPSModule
                 }
             }
         }
+        return '';
     }
 
     public function sendData(string $Payload)
     {
-        $Topic = $this->Devices($_IPS['SELF']);
+        $Topic = $this->TopicFromList($this->InstanceID);
         if ($Topic != '') {
             $this->SendMQTTData($Topic, $Payload);
 
@@ -294,74 +268,101 @@ class MQTTSyncServer extends IPSModule
         $this->SendMQTTData('VariablenProfiles', json_encode($VariablenProfiles));
     }
 
-    public function sendVariablen()
+    public function sendVariablen(): void
     {
         $DevicesJSON = $this->ReadPropertyString('Devices');
-        $Devices = json_decode($DevicesJSON);
-        $Topic = '';
-        $Instanz = null;
+        $Devices = json_decode($DevicesJSON, true, 512, JSON_THROW_ON_ERROR);
 
-        foreach ($Devices as $key => $Device) {
-            $Instanz = [];
-            $Object = IPS_GetObject($Device->ObjectID);
-            $this->SendDebug('ObjectID', $Device->ObjectID, 0);
-            if ($Object['ObjectType'] == 1) {
-                $Topic = $this->TopicFromList($Object['ObjectID']);
-                $PObject = IPS_GetObject($Object['ObjectID']);
-                $i = 0;
-                foreach ($PObject['ChildrenIDs'] as $Children) {
-                    if (IPS_VariableExists($Children)) {
-                        $tmpObject = IPS_GetObject($Children);
-                        $Instanz[$i]['ID'] = $tmpObject['ObjectID'];
-                        $Instanz[$i]['Name'] = $tmpObject['ObjectName'];
-                        $Instanz[$i]['ObjectIdent'] = $tmpObject['ObjectIdent'];
-                        $Instanz[$i]['VariableTyp'] = IPS_GetVariable($tmpObject['ObjectID'])['VariableType'];
-                        $Instanz[$i]['VariableAction'] = IPS_GetVariable($tmpObject['ObjectID'])['VariableAction'];
-                        $Instanz[$i]['VariableCustomAction'] = IPS_GetVariable($tmpObject['ObjectID'])['VariableAction'];
-                        $Instanz[$i]['VariableProfile'] = IPS_GetVariable($tmpObject['ObjectID'])['VariableProfile'];
-                        $Instanz[$i]['VariableCustomProfile'] = IPS_GetVariable($tmpObject['ObjectID'])['VariableCustomProfile'];
-                        $Instanz[$i]['Value'] = GetValue($tmpObject['ObjectID']);
-                        $i++;
-                    }
-                }
-            } else {
-                $Topic = $this->TopicFromList($Object['ObjectID']);
-                $Instanz[0]['ID'] = $Object['ObjectID'];
-                $Instanz[0]['Name'] = $Object['ObjectName'];
-                $Instanz[0]['ObjectIdent'] = $Object['ObjectIdent'];
-                $Instanz[0]['VariableTyp'] = IPS_GetVariable($Object['ObjectID'])['VariableType'];
-                $Instanz[0]['VariableAction'] = IPS_GetVariable($Object['ObjectID'])['VariableAction'];
-                $Instanz[0]['VariableCustomAction'] = IPS_GetVariable($Object['ObjectID'])['VariableCustomAction'];
-                $Instanz[0]['VariableProfile'] = IPS_GetVariable($Object['ObjectID'])['VariableProfile'];
-                $Instanz[0]['VariableCustomProfile'] = IPS_GetVariable($Object['ObjectID'])['VariableCustomProfile'];
-                $Instanz[0]['Value'] = GetValue($Object['ObjectID']);
+        foreach ($Devices as $Device) {
+            if (!@IPS_ObjectExists($Device['ObjectID'])) {
+                $this->SendDebug(__FUNCTION__, 'Object ID: ' . $Device['ObjectID'] . ' does not exist anymore!', 0);
+                continue;
             }
-            if ($Instanz != null) {
-                $Payload = json_encode($Instanz);
-                //$Payload = $Instanz;
-                $this->SendMQTTData($Topic, $Payload);
+
+            if ($Device['MQTTTopic'] === '') {
+                $this->SendDebug(__FUNCTION__, 'Topic for Object ID ' . $Device['ObjectID'] . ' is empty!', 0);
+                continue;
             }
-            if ($Topic == '') {
-                $this->SendDebug(__FUNCTION__, 'Topic for Object ID: ' . $Object['ObjectID'] . ' is not on list!', 0);
-            }
+
+            $this->sendDeviceStatus($Device['ObjectID'], $Device['MQTTTopic']);
         }
     }
 
-    private function SendMQTTData(string $topic, string $payload)
+    /**
+     * Sendet den Status eines Gerätes (Instanz oder Einzelvariable) an MQTT
+     */
+    private function sendDeviceStatus(int $objectId, string $topic): void
     {
-        $GroupTopic = $this->ReadPropertyString('GroupTopic');
+        $Object = IPS_GetObject($objectId);
+        $payloadData = [];
 
-        $Data['DataID'] = '{043EA491-0325-4ADD-8FC2-A30C8EEB4D3F}';
-        $Data['PacketType'] = 3;
-        $Data['QualityOfService'] = 0;
-        $Data['Retain'] = $this->ReadPropertyBoolean('Retain');
-        $Data['Topic'] = 'mqttsync/' . $GroupTopic . '/' . $topic;
-        $Data['Payload'] = $payload;
+        // Fall 1: Es ist eine Instanz (z.B. Heizung) -> Alle Kinder-Variablen holen
+        if ($Object['ObjectType'] === OBJECTTYPE_INSTANCE) {
+            foreach ($Object['ChildrenIDs'] as $childId) {
+                if (IPS_VariableExists($childId)) {
+                    $payloadData[] = $this->getVariableData($childId);
+                }
+            }
+        }
+        // Fall 2: Es ist direkt eine Variable -> Nur diese holen
+        elseif (IPS_VariableExists($objectId)) {
+            $payloadData[] = $this->getVariableData($objectId);
+        }
 
-        $DataJSON = json_encode($Data, JSON_UNESCAPED_SLASHES);
-        $this->SendDebug(__FUNCTION__ . 'Topic', $Data['Topic'], 0);
-        $this->SendDebug(__FUNCTION__, $DataJSON, 0);
-        $this->SendDataToParent($DataJSON);
+        if (!empty($payloadData)) {
+            $this->SendMQTTData($topic, json_encode($payloadData, JSON_THROW_ON_ERROR));
+        }
+    }
+
+    /**
+     * Hilfsmethode extrahiert alle relevanten Daten einer Variable
+     */
+    private function getVariableData(int $objectId): array
+    {
+        $object = IPS_GetObject($objectId);
+        $variable = IPS_GetVariable($objectId);
+
+        return array_filter([
+            'ID'                    => $object['ObjectID'],
+            'Name'                  => $object['ObjectName'],
+            'ObjectIdent'           => $object['ObjectIdent'],
+            'Value'                 => GetValue($objectId),
+            'VariableTyp'           => $variable['VariableType'],
+            'VariableAction'        => $variable['VariableAction'],
+            'VariableCustomAction'  => $variable['VariableCustomAction'],
+            'VariableProfile'       => $variable['VariableProfile'],
+            'VariableCustomProfile' => $variable['VariableCustomProfile'],
+            'VariablePresentation'  => $variable['VariablePresentation']??null,
+            'VariableCustomPresentation' => $variable['VariableCustomPresentation']??null
+        ], function ($value) {
+            return !is_null($value);
+        });
+    }
+
+    private function SendMQTTData(string $topic, string $payload): void
+    {
+        $groupTopic = $this->ReadPropertyString('GroupTopic');
+
+        $data = [
+            'DataID'           => self::GUID_MQTT_SEND,
+            'PacketType'       => self::MQTT_PACKET_PUBLISH,
+            'QualityOfService' => 0,
+            'Retain'           => $this->ReadPropertyBoolean('Retain'),
+            'Topic'            => sprintf('mqttsync/%s/%s', $groupTopic, $topic),
+            'Payload'          => $payload,
+        ];
+
+        try {
+            $dataJSON = json_encode($data, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+        } catch (JsonException $e) {
+            $this->SendDebug(__FUNCTION__, 'JSON encoding error: ' . $e->getMessage(), 0);
+            return;
+        }
+
+        $this->SendDebug(__FUNCTION__ . 'Topic', $data['Topic'], 0);
+        $this->SendDebug(__FUNCTION__, $dataJSON, 0);
+
+        $this->SendDataToParent($dataJSON);
     }
 
     private function isInstance($ObjectID)
